@@ -15,17 +15,19 @@ def flatten(features):
 
 
 carla_drivegan_dataset = 'D:/PycharmProjects/video-diffusion-pytorch-lucidrains/datasets/drivegan_holdout'
+dataset_subfolders = ['64053', '64054', '64055', '64056', '64057', '64058']
+
 output_directory = 'D:/PycharmProjects/video-diffusion-pytorch-lucidrains/datasets/drivegan_conditional_video'
 os.makedirs(output_directory) if not os.path.exists(output_directory) else None
 
-for folder in tqdm(os.listdir(carla_drivegan_dataset)):
+for folder in tqdm(dataset_subfolders):
     episodes = os.listdir(os.path.join(carla_drivegan_dataset, folder))
     for episode in tqdm(episodes):
         try:
             gif_images_path = os.path.join(carla_drivegan_dataset, folder, episode)
 
             fp_in = os.path.join(gif_images_path, "*.png")
-            imgs = [Image.open(f) for f in
+            imgs = [Image.open(f).resize((128, 128)) for f in
                     sorted(glob.glob(fp_in), key=lambda x: int(os.path.basename(x.replace('.png', '')).split(' ')[0]))]
 
             action_info = json.load(open(os.path.join(gif_images_path, 'info.json')))['data']
@@ -40,7 +42,7 @@ for folder in tqdm(os.listdir(carla_drivegan_dataset)):
                 # conditioned on the start image
                 fp_out_image = os.path.join(fp_out, 'start.png')
                 fp_out_gif = os.path.join(fp_out, 'forward.gif')
-                fp_out_action = os.path.join(fp_out, 'action.npy')
+                fp_out_action = os.path.join(fp_out, 'action.txt')
 
                 # conditioned on action taken at initial frame
                 action = flatten(action_info[sub_idx * 10])
@@ -48,6 +50,6 @@ for folder in tqdm(os.listdir(carla_drivegan_dataset)):
                 # save everything to disk
                 img.save(fp_out_image)
                 img.save(fp=fp_out_gif, format='GIF', append_images=sub_imgs, save_all=True, duration=200, loop=0)
-                np.save(fp_out_action, action)
+                np.savetxt(fp_out_action, action)
         except:
             continue

@@ -1,0 +1,7 @@
+setuptools~=57.0.0
+numpy~=1.21.6
+Pillow~=9.1.0
+tqdm~=4.64.0
+torch~=1.10.0+cu113
+einops~=0.4.1
+torchvision~=0.11.1+cu113

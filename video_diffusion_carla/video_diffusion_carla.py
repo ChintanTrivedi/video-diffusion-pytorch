@@ -1,23 +1,24 @@
-import math
 import copy
-import torch
-from torch import nn, einsum
-import torch.nn.functional as F
-from inspect import isfunction
+import math
+import os
 from functools import partial
-
-from torch.utils import data
+from inspect import isfunction
 from pathlib import Path
-from torch.optim import Adam
-from torchvision import transforms as T, utils
-from torch.cuda.amp import autocast, GradScaler
-from PIL import Image
 
-from tqdm import tqdm
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
 from einops import rearrange
 from einops_exts import check_shape, rearrange_many
-
 from rotary_embedding_torch import RotaryEmbedding
+from torch import einsum
+from torch import nn
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim import Adam
+from torch.utils import data
+from torchvision import transforms as T
+from tqdm import tqdm
 
 from video_diffusion_pytorch.text import tokenize, bert_embed, BERT_MODEL_DIM
 
@@ -28,10 +29,6 @@ def exists(x):
     return x is not None
 
 
-def noop(*args, **kwargs):
-    pass
-
-
 def is_odd(n):
     return (n % 2) == 1
 
@@ -40,21 +37,6 @@ def default(val, d):
     if exists(val):
         return val
     return d() if isfunction(d) else d
-
-
-def cycle(dl):
-    while True:
-        for data in dl:
-            yield data
-
-
-def num_to_groups(num, divisor):
-    groups = num // divisor
-    remainder = num % divisor
-    arr = [divisor] * groups
-    if remainder > 0:
-        arr.append(remainder)
-    return arr
 
 
 def prob_mask_like(shape, prob, device):
@@ -591,6 +573,7 @@ class GaussianDiffusion(nn.Module):
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
+        self.text_use_bert_cls = text_use_bert_cls
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -731,7 +714,7 @@ class GaussianDiffusion(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
         if is_list_str(cond):
-            cond = bert_embed(tokenize(cond), return_cls_repr=text_use_bert_cls)
+            cond = bert_embed(tokenize(cond), return_cls_repr=self.text_use_bert_cls)
             cond = cond.to(device)
 
         x_recon = self.denoise_fn(x_noisy, t, cond=cond, **kwargs)
@@ -751,6 +734,84 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         x = normalize_img(x)
         return self.p_losses(x, t, *args, **kwargs)
+
+
+def identity(t, *args, **kwargs):
+    return t
+
+
+def normalize_img(t):
+    return t * 2 - 1
+
+
+def unnormalize_img(t):
+    return (t + 1) * 0.5
+
+
+# helpers functions
+
+def exists(x):
+    return x is not None
+
+
+def noop(*args, **kwargs):
+    pass
+
+
+def is_odd(n):
+    return (n % 2) == 1
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+
+def num_to_groups(num, divisor):
+    groups = num // divisor
+    remainder = num % divisor
+    arr = [divisor] * groups
+    if remainder > 0:
+        arr.append(remainder)
+    return arr
+
+
+def prob_mask_like(shape, prob, device):
+    if prob == 1:
+        return torch.ones(shape, device=device, dtype=torch.bool)
+    elif prob == 0:
+        return torch.zeros(shape, device=device, dtype=torch.bool)
+    else:
+        return torch.zeros(shape, device=device).float().uniform_(0, 1) < prob
+
+
+def is_list_str(x):
+    if not isinstance(x, (list, tuple)):
+        return False
+    return all([type(el) == str for el in x])
+
+
+class EMA():
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+
+    def update_model_average(self, ma_model, current_model):
+        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+            old_weight, up_weight = ma_params.data, current_params.data
+            ma_params.data = self.update_average(old_weight, up_weight)
+
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
 
 
 # trainer class
@@ -817,7 +878,7 @@ def cast_num_frames(t, *, frames):
     return F.pad(t, (0, 0, 0, 0, 0, frames - f))
 
 
-class Dataset(data.Dataset):
+class CarlaDataset(data.Dataset):
     def __init__(
             self,
             folder,
@@ -832,7 +893,8 @@ class Dataset(data.Dataset):
         self.folder = folder
         self.image_size = image_size
         self.channels = channels
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        self.paths = os.listdir(self.folder)
+        # [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
 
         self.cast_num_frames_fn = partial(cast_num_frames, frames=num_frames) if force_num_frames else identity
 
@@ -848,8 +910,15 @@ class Dataset(data.Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
-        tensor = gif_to_tensor(path, self.channels, transform=self.transform)
-        return self.cast_num_frames_fn(tensor)
+        # print(f'fetching {path}')
+        start_path = os.path.join(self.folder, path, 'start.png')
+        forward_path = os.path.join(self.folder, path, 'forward.gif')
+        action_path = os.path.join(self.folder, path, 'action.txt')
+
+        action_tensor = torch.from_numpy(np.loadtxt(action_path))
+        start_tensor = self.transform(Image.open(start_path).convert('RGB'))
+        gif_tensor = self.cast_num_frames_fn(gif_to_tensor(forward_path, self.channels, transform=self.transform))
+        return start_tensor, action_tensor, gif_tensor
 
 
 # trainer class
@@ -892,7 +961,7 @@ class Trainer(object):
         channels = diffusion_model.channels
         num_frames = diffusion_model.num_frames
 
-        self.ds = Dataset(folder, image_size, channels=channels, num_frames=num_frames)
+        self.ds = CarlaDataset(folder, image_size, channels=channels, num_frames=num_frames)
 
         print(f'found {len(self.ds)} videos as gif files at {folder}')
         assert len(self.ds) > 0, 'need to have at least 1 video to start training (although 1 is not great, try 100k)'
@@ -928,7 +997,7 @@ class Trainer(object):
             'ema': self.ema_model.state_dict(),
             'scaler': self.scaler.state_dict()
         }
-        torch.save(data, str(self.results_folder / f'model.pt'))
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
     def load(self, milestone, **kwargs):
         if milestone == -1:
@@ -937,7 +1006,7 @@ class Trainer(object):
                 all_milestones) > 0, 'need to have at least one milestone to load from latest checkpoint (milestone == -1)'
             milestone = max(all_milestones)
 
-        data = torch.load(str(self.results_folder / f'model.pt'))
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
 
         self.step = data['step']
         self.model.load_state_dict(data['model'], **kwargs)
@@ -954,11 +1023,12 @@ class Trainer(object):
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
-                data = next(self.dl).cuda()
+                start_tensor, action_tensor, gif_tensor = next(self.dl).cuda()
 
                 with autocast(enabled=self.amp):
                     loss = self.model(
-                        data,
+                        gif_tensor,
+                        cond=torch.cat((start_tensor, action_tensor), dim=-1),
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask
                     )
