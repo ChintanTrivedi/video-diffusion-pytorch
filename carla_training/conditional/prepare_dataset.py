@@ -1,9 +1,16 @@
 import glob
-from PIL import Image
-import os
 import json
-from tqdm import tqdm
+import os
+
+import clip
 import numpy as np
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+# pretrained CLP model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model, preprocess = clip.load("ViT-B/32", device=device)
 
 
 def flatten(features):
@@ -38,9 +45,14 @@ for folder in tqdm(dataset_subfolders):
 
                 # extract first image from iterator
                 img = next(sub_imgs)
+                img_tensor = preprocess(img).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    img_emb = model.encode_image(img_tensor)
+                    img_emb = img_emb.cpu().numpy().T
 
                 # conditioned on the start image
                 fp_out_image = os.path.join(fp_out, 'start.png')
+                fp_out_image_emb = os.path.join(fp_out, 'start_emb.txt')
                 fp_out_gif = os.path.join(fp_out, 'forward.gif')
                 fp_out_action = os.path.join(fp_out, 'action.txt')
 
@@ -51,5 +63,6 @@ for folder in tqdm(dataset_subfolders):
                 img.save(fp_out_image)
                 img.save(fp=fp_out_gif, format='GIF', append_images=sub_imgs, save_all=True, duration=200, loop=0)
                 np.savetxt(fp_out_action, action)
+                np.savetxt(fp_out_image_emb, img_emb)
         except:
             continue
