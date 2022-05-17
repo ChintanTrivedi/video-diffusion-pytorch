@@ -910,15 +910,29 @@ class CarlaDataset(data.Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
-        # print(f'fetching {path}')
-        start_path = os.path.join(self.folder, path, 'start.png')
+        # start_path = os.path.join(self.folder, path, 'start.png')
+        start_emb_path = os.path.join(self.folder, path, 'start_emb.txt')
         forward_path = os.path.join(self.folder, path, 'forward.gif')
         action_path = os.path.join(self.folder, path, 'action.txt')
 
-        action_tensor = torch.from_numpy(np.loadtxt(action_path))
-        start_tensor = self.transform(Image.open(start_path).convert('RGB'))
+        action_tensor = torch.Tensor(np.loadtxt(action_path))
+        start_emb_tensor = torch.Tensor(np.loadtxt(start_emb_path))
+        # start_tensor = self.transform(Image.open(start_path).convert('RGB'))
         gif_tensor = self.cast_num_frames_fn(gif_to_tensor(forward_path, self.channels, transform=self.transform))
-        return start_tensor, action_tensor, gif_tensor
+        return start_emb_tensor, action_tensor, gif_tensor
+
+
+def get_sampling_conditions(samples_path, samples_count):
+    samples_options = os.listdir(samples_path)
+    total_samples = len(samples_options)
+    assert (samples_count <= total_samples), f"maximum {total_samples} samples allowed"
+    cond_samples = []
+    for sample_idx in range(samples_count):
+        sample_folder = os.path.join(samples_path, samples_options[sample_idx])
+        action_tensor = torch.Tensor(np.loadtxt(os.path.join(sample_folder, 'start_emb.txt')))
+        start_emb_tensor = torch.Tensor(np.loadtxt(os.path.join(sample_folder, 'action.txt')))
+        cond_samples.append(torch.cat((action_tensor, start_emb_tensor), dim=-1))
+    return torch.stack(cond_samples, dim=0).cuda()
 
 
 # trainer class
@@ -929,10 +943,11 @@ class Trainer(object):
             diffusion_model,
             folder,
             *,
+            cond_sampling_folder=None,
             ema_decay=0.995,
             num_frames=16,
             train_batch_size=32,
-            train_lr=2e-5,
+            train_lr=1e-4,
             train_num_steps=100000,
             gradient_accumulate_every=2,
             amp=False,
@@ -951,6 +966,7 @@ class Trainer(object):
 
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
+        self.cond_sampling_folder = cond_sampling_folder
 
         self.batch_size = train_batch_size
         self.image_size = diffusion_model.image_size
@@ -997,7 +1013,7 @@ class Trainer(object):
             'ema': self.ema_model.state_dict(),
             'scaler': self.scaler.state_dict()
         }
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        torch.save(data, str(self.results_folder / f'model.pt'))
 
     def load(self, milestone, **kwargs):
         if milestone == -1:
@@ -1006,7 +1022,7 @@ class Trainer(object):
                 all_milestones) > 0, 'need to have at least one milestone to load from latest checkpoint (milestone == -1)'
             milestone = max(all_milestones)
 
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
+        data = torch.load(str(self.results_folder / f'model.pt'))
 
         self.step = data['step']
         self.model.load_state_dict(data['model'], **kwargs)
@@ -1023,12 +1039,12 @@ class Trainer(object):
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
-                start_tensor, action_tensor, gif_tensor = next(self.dl).cuda()
+                start_tensor, action_tensor, gif_tensor = next(self.dl)
 
                 with autocast(enabled=self.amp):
                     loss = self.model(
-                        gif_tensor,
-                        cond=torch.cat((start_tensor, action_tensor), dim=-1),
+                        gif_tensor.cuda(),
+                        cond=torch.cat((start_tensor, action_tensor), dim=-1).cuda(),
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask
                     )
@@ -1055,11 +1071,18 @@ class Trainer(object):
                 num_samples = self.num_sample_rows ** 2
                 batches = num_to_groups(num_samples, self.batch_size)
 
-                all_videos_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
+                if self.model.denoise_fn.has_cond:
+                    cond_sampling = get_sampling_conditions(samples_path=self.cond_sampling_folder,
+                                                            samples_count=np.sum(batches))
+                    all_videos_list = list(
+                        map(lambda n: self.ema_model.sample(batch_size=n[1],
+                                                            cond=torch.unsqueeze(cond_sampling[n[0]], dim=0)),
+                            enumerate(batches)))
+                else:
+                    all_videos_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
+
                 all_videos_list = torch.cat(all_videos_list, dim=0)
-
                 all_videos_list = F.pad(all_videos_list, (2, 2, 2, 2))
-
                 one_gif = rearrange(all_videos_list, '(i j) c f h w -> c f (i h) (j w)', i=self.num_sample_rows)
                 video_path = str(self.results_folder / str(f'{milestone}.gif'))
                 video_tensor_to_gif(one_gif, video_path)

@@ -18,7 +18,7 @@ trainer = Trainer(
     diffusion,
     './data',
     train_batch_size=4,
-    train_lr=2e-5,
+    train_lr=1e-4,
     save_and_sample_every=5000,
     train_num_steps=700000,  # total training steps
     gradient_accumulate_every=2,  # gradient accumulation steps
